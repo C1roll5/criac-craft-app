@@ -4,17 +4,11 @@ from datetime import datetime
 from supabase import create_client, Client
 
 # --- CONFIGURAÇÃO DA PÁGINA E TEMA ---
-st.set_page_config(page_title="Cria.C Craft", page_icon="🎨", layout="wide")
-
-# CSS personalizado para a paleta Rose/Beige (#C28B96)
-st.markdown("""
 st.set_page_config(page_title="Cria.C Craft", page_icon="✂️", layout="wide")
 
 # CSS personalizado com a paleta oficial da logo Cria.C Craft
 st.markdown("""
 
-""", unsafe_allow_html=True)
-    
 """, unsafe_allow_html=True)
 
 # --- CONEXÃO SUPABASE ---
