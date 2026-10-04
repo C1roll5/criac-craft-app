@@ -25,11 +25,7 @@ supabase = init_supabase()
 
 
 # --- GERENCIADOR DE COOKIES (LOGIN PERSISTENTE) ---
-@st.cache_resource
-def get_cookie_manager():
-    return stx.CookieManager()
-
-cookie_manager = get_cookie_manager()
+cookie_manager = stx.CookieManager()
 
 # Tenta recuperar o token/email salvo no navegador do celular ou PC
 saved_user_email = cookie_manager.get(cookie="criac_craft_user_email")
