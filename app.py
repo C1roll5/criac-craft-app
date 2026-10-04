@@ -7,13 +7,10 @@ from supabase import Client, create_client
 # --- CONFIGURAÇÃO DA PÁGINA E TEMA ---
 st.set_page_config(page_title="Cria.C Craft", page_icon="✂️", layout="wide")
 
-# CSS personalizado com a paleta oficial
-st.markdown(
-    """
-    
-    """,
-    unsafe_allow_html=True,
-)
+# CSS personalizado com a paleta oficial da logo Cria.C Craft
+st.markdown("""
+
+""", unsafe_allow_html=True)
 
 
 # --- CONEXÃO SUPABASE ---
