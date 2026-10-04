@@ -1,15 +1,20 @@
-import streamlit as st
+import datetime
+import extra_streamlit_components as stx
 import pandas as pd
-from datetime import datetime
-from supabase import create_client, Client
+import streamlit as st
+from supabase import Client, create_client
 
 # --- CONFIGURAÇÃO DA PÁGINA E TEMA ---
 st.set_page_config(page_title="Cria.C Craft", page_icon="✂️", layout="wide")
 
 # CSS personalizado com a paleta oficial da logo Cria.C Craft
-st.markdown("""
+st.markdown(
+    """
 
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
 
 # --- CONEXÃO SUPABASE ---
 @st.cache_resource
@@ -18,57 +23,147 @@ def init_supabase() -> Client:
     key = st.secrets["SUPABASE_KEY"].strip()
     return create_client(url, key)
 
+
 supabase = init_supabase()
 
-# --- SESSÃO ---
+
+# --- GERENCIADOR DE COOKIES (LOGIN PERSISTENTE) ---
+@st.cache_resource(experimental_allow_widgets=True)
+def get_cookie_manager():
+    return stx.CookieManager()
+
+
+cookie_manager = get_cookie_manager()
+
+# Tenta recuperar o token/email salvo no navegador do celular ou PC
+saved_user_email = cookie_manager.get(cookie="criac_craft_user_email")
+saved_user_id = cookie_manager.get(cookie="criac_craft_user_id")
+
+# --- GERENCIAMENTO DE SESSÃO ---
 if "user" not in st.session_state:
     st.session_state.user = None
+
+# Se houver um cookie salvo e a sessão ainda estiver vazia, restaura o acesso
+if (
+    st.session_state.user is None
+    and saved_user_id
+    and saved_user_email
+):
+    class SavedUser:
+        def __init__(self, uid, email):
+            self.id = uid
+            self.email = email
+
+    st.session_state.user = SavedUser(saved_user_id, saved_user_email)
 
 # --- TELA DE LOGIN ---
 if st.session_state.user is None:
     st.title("🎨 Artesanato Cria.C")
     st.subheader("Arte, paixão e personalização — Sistema de Gestão")
-    
+
     tab_login, tab_cad = st.tabs(["🔑 Entrar", "📝 Criar Conta"])
-    
+
     with tab_login:
         email = st.text_input("E-mail", key="l_email")
         senha = st.text_input("Senha", type="password", key="l_senha")
+        manter_conectado = st.checkbox(
+            "Manter-me conectado neste dispositivo", value=True
+        )
+
         if st.button("Acessar Painel"):
             try:
-                res = supabase.auth.sign_in_with_password({"email": email, "password": senha})
+                res = supabase.auth.sign_in_with_password(
+                    {"email": email, "password": senha}
+                )
                 st.session_state.user = res.user
+
+                # Salva o cookie no navegador por 30 dias se marcado
+                if manter_conectado:
+                    valida_ate = datetime.datetime.now() + datetime.timedelta(
+                        days=30
+                    )
+                    cookie_manager.set(
+                        "criac_craft_user_email",
+                        res.user.email,
+                        expires_at=valida_ate,
+                    )
+                    cookie_manager.set(
+                        "criac_craft_user_id",
+                        res.user.id,
+                        expires_at=valida_ate,
+                    )
+
+                st.success("Login realizado com sucesso!")
                 st.rerun()
             except Exception as e:
                 st.error(f"Erro ao entrar: {e}")
-                
+
     with tab_cad:
         c_email = st.text_input("E-mail para cadastro", key="c_email")
         c_senha = st.text_input("Senha", type="password", key="c_senha")
         if st.button("Cadastrar Nova Conta"):
             try:
-                supabase.auth.sign_up({"email": c_email, "password": c_senha})
-                st.success("Conta criada! Se necessário, confirme o e-mail ou faça login.")
+                supabase.auth.sign_up(
+                    {"email": c_email, "password": c_senha}
+                )
+                st.success(
+                    "Conta criada! Se necessário, confirme o e-mail ou faça login."
+                )
             except Exception as e:
                 st.error(f"Erro ao cadastrar: {e}")
-    st.stop()
 
-# --- PAINEL PRINCIPAL ---
+    st.stop()  # Para a execução até que o login seja realizado
+
+# --- PAINEL PRINCIPAL (ÁREA LOGADA) ---
 user_id = st.session_state.user.id
+user_email = getattr(st.session_state.user, "email", "Usuária")
 
 st.sidebar.title("🎨 Cria.C Craft")
-if st.sidebar.button("Sair / Logout"):
+st.sidebar.caption(f"Conectado como: **{user_email}**")
+
+if st.sidebar.button("🚪 Sair / Logout"):
+    # Limpa a sessão e os cookies salvos no dispositivo
     st.session_state.user = None
+    cookie_manager.delete("criac_craft_user_email")
+    cookie_manager.delete("criac_craft_user_id")
     st.rerun()
 
-aba = st.sidebar.radio("Navegação", [
-    "📦 Cadastro de Insumos", 
-    "🧮 Calculadora de Preços", 
-    "📋 Fichas Técnicas", 
-    "📖 Catálogo (PF vs PJ)",
-    "💰 Fluxo de Caixa",
-    "🛍️ Revenda"
-])
+aba = st.sidebar.radio(
+    "Navegação",
+    [
+        "📦 Cadastro de Insumos",
+        "🧮 Calculadora de Preços",
+        "📋 Fichas Técnicas",
+        "📖 Catálogo (PF vs PJ)",
+        "💰 Fluxo de Caixa",
+        "🛍️ Revenda",
+    ],
+)
+
+# --- CONTEÚDO DAS ABAS ---
+if aba == "📦 Cadastro de Insumos":
+    st.title("📦 Cadastro de Insumos")
+    st.write("Gerencie seus materiais, fitas, papéis e insumos aqui.")
+
+elif aba == "🧮 Calculadora de Preços":
+    st.title("🧮 Calculadora de Preços")
+    st.write("Calcule o preço ideal de venda dos seus produtos artesanais.")
+
+elif aba == "📋 Fichas Técnicas":
+    st.title("📋 Fichas Técnicas")
+    st.write("Crie e consulte as fichas técnicas das suas peças.")
+
+elif aba == "📖 Catálogo (PF vs PJ)":
+    st.title("📖 Catálogo (PF vs PJ)")
+    st.write("Visualize a tabela de preços diferenciada para atacado e varejo.")
+
+elif aba == "💰 Fluxo de Caixa":
+    st.title("💰 Fluxo de Caixa")
+    st.write("Acompanhe suas entradas, saídas e lucro mensal.")
+
+elif aba == "🛍️ Revenda":
+    st.title("🛍️ Revenda")
+    st.write("Controle de produtos de revenda e pedidos.")
 
 # ---------------------------------------------------------
 # ABA 1: CADASTRO DE INSUMOS
