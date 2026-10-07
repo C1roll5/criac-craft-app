@@ -2,3 +2,9 @@ streamlit
 pandas
 supabase
 extra-streamlit-components
+streamlit>=1.40
+supabase>=2.9
+extra-streamlit-components
+pandas
+openpyxl
+fpdf2
