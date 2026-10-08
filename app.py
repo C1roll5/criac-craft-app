@@ -2,24 +2,128 @@ import datetime
 import json
 import unicodedata
 from io import BytesIO
+from pathlib import Path
 
 import altair as alt
 import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
+from PIL import Image
 from supabase import Client, create_client
 
 # =============================================================================
 # CONFIGURAÇÃO DA PÁGINA E TEMA
 # =============================================================================
-st.set_page_config(page_title="Cria.C Craft", page_icon="✂️", layout="wide")
+ASSETS = Path(__file__).parent / "assets"
 
+
+def _icone_pagina():
+    arq = ASSETS / "icone.png"
+    try:
+        return Image.open(arq) if arq.exists() else "✂️"
+    except Exception:
+        return "✂️"
+
+
+st.set_page_config(page_title="Cria.C Craft", page_icon=_icone_pagina(), layout="wide")
+
+# Paleta tirada da logo:
+#   creme #F8F5F0 | grafite #3A3A38 | rosa #C99499 | rosa escuro #B07A82 | dourado #C9A063
 CSS_PERSONALIZADO = """
 <style>
-/* Cole aqui o seu CSS original com a paleta da logo Cria.C Craft */
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,500;0,600;1,400&display=swap');
+
+:root {
+    --creme: #F8F5F0;
+    --creme-2: #F1E9E4;
+    --grafite: #3A3A38;
+    --rosa: #C99499;
+    --rosa-escuro: #B07A82;
+    --dourado: #C9A063;
+}
+
+/* Títulos com a mesma serifa da logo */
+h1, h2, h3, [data-testid="stMetricValue"] {
+    font-family: 'Playfair Display', Georgia, serif !important;
+    color: var(--grafite);
+    font-weight: 500;
+}
+h1 { letter-spacing: .3px; }
+
+/* Barra lateral */
+[data-testid="stSidebar"] {
+    background: var(--creme-2);
+    border-right: 1px solid rgba(201, 160, 99, .35);
+}
+
+/* Divisor tracejado, como na logo */
+hr {
+    border: none !important;
+    border-top: 2px dashed rgba(201, 148, 153, .75) !important;
+    background: none !important;
+}
+
+/* Botões */
+.stButton > button,
+.stDownloadButton > button,
+[data-testid="stFormSubmitButton"] > button {
+    border-radius: 999px;
+    border: 1px solid var(--rosa);
+    color: var(--grafite);
+    background: #fffdfb;
+}
+.stButton > button:hover,
+.stDownloadButton > button:hover,
+[data-testid="stFormSubmitButton"] > button:hover {
+    border-color: var(--rosa-escuro);
+    color: var(--rosa-escuro);
+}
+.stButton > button[kind="primary"],
+[data-testid="stFormSubmitButton"] > button[kind="primary"] {
+    background: var(--rosa-escuro);
+    border-color: var(--rosa-escuro);
+    color: #fff;
+}
+
+/* Cartões de métricas */
+[data-testid="stMetric"] {
+    background: rgba(255, 255, 255, .65);
+    border: 1px solid rgba(201, 148, 153, .35);
+    border-left: 4px solid var(--dourado);
+    border-radius: 14px;
+    padding: 12px 16px;
+}
+
+/* Expanders e abas */
+[data-testid="stExpander"] {
+    border: 1px solid rgba(201, 148, 153, .4);
+    border-radius: 12px;
+    background: #fffdfb;
+}
+[data-baseweb="tab-highlight"] { background-color: var(--rosa) !important; }
+button[aria-selected="true"] { color: var(--rosa-escuro) !important; }
+
+/* Frase de efeito (itálico, igual à logo) */
+.frase-marca {
+    font-family: 'Playfair Display', Georgia, serif;
+    font-style: italic;
+    color: var(--grafite);
+    text-align: center;
+    margin-top: -6px;
+}
 </style>
 """
 st.markdown(CSS_PERSONALIZADO, unsafe_allow_html=True)
+
+
+def mostrar_logo(arquivo, sidebar=False, fallback=""):
+    """Mostra uma imagem da pasta assets; se não existir, usa um texto."""
+    alvo = st.sidebar if sidebar else st
+    caminho = ASSETS / arquivo
+    if caminho.exists():
+        alvo.image(str(caminho))
+    elif fallback:
+        alvo.title(fallback)
 
 # =============================================================================
 # CONSTANTES
@@ -264,8 +368,12 @@ def gerar_pdf_catalogo(itens, taxa_cartao):
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
+    logo = ASSETS / "logo_completo.png"
+    if logo.exists():
+        pdf.image(str(logo), x=(210 - 70) / 2, y=10, w=70)
+        pdf.set_y(10 + 70 * 530 / 810 + 6)
     pdf.set_font("Helvetica", "B", 18)
-    linha(pdf, "Catálogo Cria.C Craft", 10)
+    linha(pdf, "Catálogo de Produtos" if logo.exists() else "Catálogo Cria.C Craft", 10)
     pdf.set_font("Helvetica", "", 10)
     linha(pdf, f"Gerado em {datetime.date.today():%d/%m/%Y}", 6)
     pdf.ln(4)
@@ -391,8 +499,14 @@ def encerrar_sessao():
 
 
 def tela_login(cm):
-    st.title("🎨 Artesanato Cria.C")
-    st.subheader("Arte, paixão e personalização — Sistema de Gestão")
+    _, centro, _ = st.columns([1, 2, 1])
+    with centro:
+        if (ASSETS / "logo_completo.png").exists():
+            mostrar_logo("logo_completo.png")
+            st.markdown('<p class="frase-marca">Sistema de Gestão</p>', unsafe_allow_html=True)
+        else:
+            st.title("Cria.C Craft")
+            st.caption("Arte, afeto e personalização — Sistema de Gestão")
 
     if st.session_state.get("logout_flag") and cookie_existe(cm):
         cm.delete(COOKIE, key="del_cookie_logout")
@@ -969,7 +1083,7 @@ def aba_caixa(db, uid, cfg):
             y=alt.Y("Valor:Q", title="R$"),
             color=alt.Color(
                 "Tipo:N",
-                scale=alt.Scale(domain=["Entradas", "Saídas"], range=["#2e7d32", "#c62828"]),
+                scale=alt.Scale(domain=["Entradas", "Saídas"], range=["#7E9F85", "#B5646E"]),
                 legend=alt.Legend(orient="top", title=None),
             ),
             tooltip=["Mês", "Tipo", alt.Tooltip("Valor:Q", format=",.2f", title="R$")],
@@ -1311,7 +1425,7 @@ def main():
     uid = user.id
     mostrar_flash()
 
-    st.sidebar.title("🎨 Cria.C Craft")
+    mostrar_logo("logo_nome.png", sidebar=True, fallback="Cria.C Craft")
     st.sidebar.caption(f"Conectado como: **{getattr(user, 'email', 'Usuária')}**")
     if st.sidebar.button("🚪 Sair / Logout"):
         encerrar_sessao()
