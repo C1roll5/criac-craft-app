@@ -3,6 +3,7 @@ import json
 import unicodedata
 from io import BytesIO
 
+import altair as alt
 import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
@@ -959,7 +960,21 @@ def aba_caixa(db, uid, cfg):
             if col not in piv.columns:
                 piv[col] = 0.0
         piv = piv[["Entrada", "Saída"]].rename(columns={"Entrada": "Entradas", "Saída": "Saídas"}).sort_index()
-        st.bar_chart(piv)
+        longo = piv.reset_index().melt("mes", var_name="Tipo", value_name="Valor")
+        longo["Mês"] = pd.to_datetime(longo["mes"] + "-01").dt.strftime("%m/%Y")
+        ordem_meses = list(pd.to_datetime(sorted(longo["mes"].unique())).strftime("%m/%Y"))
+        grafico = alt.Chart(longo).mark_bar().encode(
+            x=alt.X("Mês:N", sort=ordem_meses, title=None, axis=alt.Axis(labelAngle=0)),
+            xOffset="Tipo:N",
+            y=alt.Y("Valor:Q", title="R$"),
+            color=alt.Color(
+                "Tipo:N",
+                scale=alt.Scale(domain=["Entradas", "Saídas"], range=["#2e7d32", "#c62828"]),
+                legend=alt.Legend(orient="top", title=None),
+            ),
+            tooltip=["Mês", "Tipo", alt.Tooltip("Valor:Q", format=",.2f", title="R$")],
+        ).properties(height=300)
+        st.altair_chart(grafico)
     else:
         st.caption("Registre lançamentos com data para ver o gráfico.")
 
