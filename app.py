@@ -1,5 +1,6 @@
 import datetime
 import json
+import math
 import unicodedata
 from io import BytesIO
 from pathlib import Path
@@ -150,6 +151,7 @@ CFG_PADRAO = {
     "custos_fixos_pct": 10.0,
     "taxa_cartao_pct": 4.5,
     "reserva_giro_pct": 10.0,
+    "marketplace_adicional": 0.0,
 }
 
 # (rótulo, quantidade mínima, fator de tempo por peça em lote)
@@ -426,6 +428,7 @@ def carregar_config(_db, user_id):
     cfg = dict(CFG_PADRAO)
     for k in CFG_PADRAO:
         cfg[k] = to_f(row.get(k), CFG_PADRAO[k])
+    cfg["faixas_marketplace"] = normalizar_faixas(row.get("faixas_marketplace"))
     cfg["id"] = row.get("id")
     return cfg
 
@@ -563,11 +566,31 @@ def aba_configuracoes(db, uid, cfg):
                                  value=cfg["taxa_cartao_pct"], step=0.5)
         reserva = c5.number_input("Reserva / giro do caixa (%)", min_value=0.0, max_value=50.0,
                                   value=cfg["reserva_giro_pct"], step=1.0)
+        st.markdown("**🛒 Taxas do Marketplace (Shopee)**")
+        st.caption("Comissão e taxa fixa mudam conforme o preço do item. Confira os valores na sua Central do "
+                   "Vendedor e ajuste a tabela. Na última faixa deixe o campo 'Até' vazio (sem limite).")
+        adicional = st.number_input(
+            "Adicional por item (R$)", min_value=0.0, value=cfg["marketplace_adicional"], step=0.5,
+            help="Somado à taxa fixa de todas as faixas. Ex.: vendedores CPF podem pagar R$ 3,00 a mais por item.")
+        df_faixas = st.data_editor(
+            pd.DataFrame([{
+                "De (R$)": f["de"],
+                "Até (R$)": f["ate"] if f["ate"] is not None else float("nan"),
+                "Comissão (%)": f["comissao_pct"],
+                "Taxa fixa (R$)": f["taxa_fixa"],
+            } for f in cfg["faixas_marketplace"]]),
+            num_rows="dynamic", hide_index=True, key="editor_faixas_mkt",
+        )
         salvar = st.form_submit_button("💾 Salvar configurações")
 
     st.caption(f"💡 Com esses valores, o seu tempo vale **{brl(salario / horas)}/hora**.")
 
     if salvar:
+        novas_faixas = normalizar_faixas([
+            {"de": r["De (R$)"], "ate": r["Até (R$)"],
+             "comissao_pct": r["Comissão (%)"], "taxa_fixa": r["Taxa fixa (R$)"]}
+            for _, r in df_faixas.iterrows()
+        ])
         payload = {
             "user_id": uid,
             "salario_pretendido": salario,
@@ -575,6 +598,8 @@ def aba_configuracoes(db, uid, cfg):
             "custos_fixos_pct": cf,
             "taxa_cartao_pct": cartao,
             "reserva_giro_pct": reserva,
+            "marketplace_adicional": adicional,
+            "faixas_marketplace": novas_faixas,
         }
         if cfg.get("id"):
             res = executar(db.table("configuracoes_usuario").update(payload).eq("id", cfg["id"]))
@@ -1159,17 +1184,138 @@ def aba_caixa(db, uid, cfg):
 
 
 # =============================================================================
-# ABA 6: REVENDA (ESTOQUE + KITS + ORÇAMENTO WHATSAPP)
+# ABA 6: REVENDA (ESTOQUE + PREÇOS COM TAXAS + KITS + ORÇAMENTO WHATSAPP)
 # =============================================================================
+# Valores de referência (confira na Central do Vendedor; editáveis em ⚙️ Configurações)
+FAIXAS_MKT_PADRAO = [
+    {"de": 0.0, "ate": 79.99, "comissao_pct": 20.0, "taxa_fixa": 4.50},
+    {"de": 80.0, "ate": 99.99, "comissao_pct": 14.0, "taxa_fixa": 16.00},
+    {"de": 100.0, "ate": 199.99, "comissao_pct": 14.0, "taxa_fixa": 20.00},
+    {"de": 200.0, "ate": None, "comissao_pct": 14.0, "taxa_fixa": 26.00},
+]
+
+
+def _vazio(v):
+    return v is None or v == "" or (isinstance(v, float) and math.isnan(v))
+
+
+def normalizar_faixas(faixas):
+    """Aceita lista/JSON, limpa, ordena e devolve a tabela de faixas do marketplace."""
+    if isinstance(faixas, str):
+        try:
+            faixas = json.loads(faixas)
+        except Exception:
+            faixas = None
+    saida = []
+    for f in faixas or []:
+        if not isinstance(f, dict) or _vazio(f.get("de")):
+            continue
+        saida.append({
+            "de": to_f(f.get("de")),
+            "ate": None if _vazio(f.get("ate")) else to_f(f.get("ate")),
+            "comissao_pct": 0.0 if _vazio(f.get("comissao_pct")) else to_f(f.get("comissao_pct")),
+            "taxa_fixa": 0.0 if _vazio(f.get("taxa_fixa")) else to_f(f.get("taxa_fixa")),
+        })
+    saida.sort(key=lambda x: x["de"])
+    return saida or [dict(f) for f in FAIXAS_MKT_PADRAO]
+
+
+def faixa_do_preco(preco, faixas):
+    for f in faixas:
+        if preco >= f["de"] - 0.005 and (f["ate"] is None or preco <= f["ate"] + 0.005):
+            return f
+    return faixas[-1]
+
+
+def taxas_marketplace(preco, faixas, adicional=0.0):
+    """Comissão (R$) e taxa fixa (R$) que o marketplace cobra nesse preço."""
+    f = faixa_do_preco(preco, faixas)
+    return preco * f["comissao_pct"] / 100.0, f["taxa_fixa"] + adicional
+
+
+def preco_minimo(custo, margem_pct, usa_mkt, faixas, adicional=0.0):
+    """Menor preço (em centavos) que cobre custo + taxas + margem sobre o preço.
+    Como a taxa depende da faixa e a faixa depende do preço, testa cada faixa."""
+    m = margem_pct / 100.0
+    if not usa_mkt:
+        return math.ceil(custo / (1 - m) * 100 - 1e-9) / 100 if m < 1 else None
+    candidatos = []
+    for f in faixas:
+        com = f["comissao_pct"] / 100.0
+        if com + m >= 1:
+            continue
+        p = math.ceil((custo + f["taxa_fixa"] + adicional) / (1 - com - m) * 100 - 1e-9) / 100
+        p = max(p, f["de"])
+        if f["ate"] is not None and p > f["ate"] + 0.005:
+            continue  # o preço calculado já cai numa faixa mais alta
+        candidatos.append(p)
+    return min(candidatos) if candidatos else None
+
+
+def decompor_preco(avista, custo, usa_mkt, cfg):
+    """Para onde vai o dinheiro: preço à vista (com taxas do marketplace) e no cartão."""
+    com, fixa = (0.0, 0.0)
+    if usa_mkt:
+        com, fixa = taxas_marketplace(avista, cfg["faixas_marketplace"], cfg["marketplace_adicional"])
+    tc = cfg["taxa_cartao_pct"] / 100.0
+    cartao = avista / (1 - tc) if tc < 1 else avista
+    lucro = avista - custo - com - fixa
+    return {
+        "avista": avista, "cartao": cartao, "custo": custo,
+        "comissao": com, "fixa": fixa, "taxa_cartao_rs": cartao - avista,
+        "lucro": lucro, "margem_real": lucro / avista * 100 if avista else 0.0,
+        "liquido": custo + lucro,  # o que realmente entra (igual no PIX e no cartão)
+    }
+
+
+def precificar_revenda(custo, margem_pct, manual, usa_mkt, cfg):
+    """Preço à vista/PIX e no cartão. Se houver preço manual, usa ele."""
+    if to_f(manual) > 0:
+        base = round(to_f(manual), 2)
+    else:
+        base = preco_minimo(custo, margem_pct, usa_mkt, cfg["faixas_marketplace"], cfg["marketplace_adicional"])
+        if base is None:
+            return None
+    return decompor_preco(base, custo, usa_mkt, cfg)
+
+
+def tabela_decomposicao(r):
+    cart = r["cartao"]
+    linhas = [
+        ("Preço cobrado do cliente", brl(r["avista"]), brl(cart)),
+        ("Custo (produto + embalagem)", brl(r["custo"]), brl(r["custo"])),
+        ("Comissão do marketplace", brl(r["comissao"]), brl(r["comissao"])),
+        ("Taxa fixa por venda", brl(r["fixa"]), brl(r["fixa"])),
+        ("Taxa do cartão", brl(0), brl(r["taxa_cartao_rs"])),
+        ("Lucro líquido", brl(r["lucro"]), brl(r["lucro"])),
+        ("Margem real sobre o preço", f"{fmt_num(r['margem_real'], 1)}%",
+         f"{fmt_num(r['lucro'] / cart * 100 if cart else 0, 1)}%"),
+    ]
+    return pd.DataFrame(linhas, columns=["", "À vista / PIX", "No cartão"])
+
+
+def parametros_revenda(p):
+    margem = to_f(p.get("margem_pct"), 30.0)
+    manual = to_f(p.get("preco_manual"), 0.0)
+    usa = p.get("usa_marketplace")
+    return margem, manual, (True if usa is None else bool(usa))
+
+
 def aba_revenda(db, uid, cfg):
     st.header("🛍️ Gestão, Estoque e Precificação de Revenda")
     st.caption("Cadastre seus itens de revenda, controle o estoque, monte Kits e gere propostas para WhatsApp.")
 
     tab_cat, tab_kit = st.tabs(["📦 Catálogo & Estoque", "🎁 Montador de Kits & Orçamentos"])
     produtos = carregar(db, "produtos_revenda", uid, "nome_produto")
+    faixas = cfg["faixas_marketplace"]
 
     # ---------------- TAB 1: CATÁLOGO & ESTOQUE ----------------
     with tab_cat:
+        st.info(
+            "💡 O preço **à vista/PIX já inclui** a comissão e a taxa fixa do marketplace. "
+            f"O preço **no cartão** soma só a taxa do cartão ({fmt_num(cfg['taxa_cartao_pct'], 1)}%) por cima. "
+            "As faixas do marketplace ficam em ⚙️ Configurações."
+        )
         st.subheader("➕ Cadastrar Produto Individual")
         with st.form("form_novo_prod_revenda", clear_on_submit=True):
             c1, c2 = st.columns(2)
@@ -1181,19 +1327,31 @@ def aba_revenda(db, uid, cfg):
             c5, c6 = st.columns(2)
             qtd_est = c5.number_input("Estoque Atual (Unidades):", min_value=0, value=10, step=1)
             est_min = c6.number_input("Estoque Mínimo de Alerta:", min_value=0, value=5, step=1)
+            st.markdown("**💰 Preço de revenda**")
+            c7, c8, c9 = st.columns(3)
+            margem_p = c7.number_input("Margem de lucro sobre o preço (%)", min_value=0.0, max_value=90.0, value=30.0, step=1.0)
+            manual_p = c8.number_input("Preço manual à vista (R$) - opcional", min_value=0.0, value=0.0, step=0.10, format="%.2f",
+                                       help="Se preencher, usa esse preço (ex.: 29,90) e mostra a margem real.")
+            usa_p = c9.checkbox("Vende no marketplace (incluir taxas)", value=True)
             cadastrar = st.form_submit_button("💾 Salvar Produto no Catálogo")
         if cadastrar:
             if not nome_p:
                 st.error("⚠️ Informe o nome do produto.")
             else:
-                res = executar(db.table("produtos_revenda").insert({
-                    "user_id": uid, "nome_produto": nome_p, "categoria": cat_p or "Geral",
-                    "preco_custo": custo_p, "frete_embalagem": frete_p,
-                    "qtd_estoque": qtd_est, "estoque_minimo": est_min,
-                }))
-                if res is not None:
-                    flash(f"Produto {nome_p} salvo no catálogo!", "🎉")
-                    st.rerun()
+                r = precificar_revenda(custo_p + frete_p, margem_p, manual_p, usa_p, cfg)
+                if r is None:
+                    st.error("Margem + comissão do marketplace chegam a 100% ou mais. Reduza a margem.")
+                else:
+                    res = executar(db.table("produtos_revenda").insert({
+                        "user_id": uid, "nome_produto": nome_p, "categoria": cat_p or "Geral",
+                        "preco_custo": custo_p, "frete_embalagem": frete_p,
+                        "qtd_estoque": qtd_est, "estoque_minimo": est_min,
+                        "margem_pct": margem_p, "preco_manual": manual_p, "usa_marketplace": usa_p,
+                        "preco_revenda": r["avista"], "preco_revenda_cartao": r["cartao"],
+                    }))
+                    if res is not None:
+                        flash(f"Produto {nome_p} salvo: à vista {brl(r['avista'])} | cartão {brl(r['cartao'])}", "🎉")
+                        st.rerun()
 
         st.divider()
         st.subheader("📋 Meus Produtos em Estoque")
@@ -1204,6 +1362,39 @@ def aba_revenda(db, uid, cfg):
             if baixo:
                 st.warning(f"⚠️ **Atenção:** {len(baixo)} produto(s) com estoque igual ou abaixo do mínimo!")
 
+            if st.button("🔄 Recalcular e salvar os preços de TODOS os produtos",
+                         help="Use quando mudar custos, margens ou as taxas do marketplace/cartão."):
+                erros = 0
+                for p in produtos:
+                    margem, manual, usa = parametros_revenda(p)
+                    custo_t = to_f(p.get("preco_custo")) + to_f(p.get("frete_embalagem"))
+                    r = precificar_revenda(custo_t, margem, manual, usa, cfg)
+                    if r is None:
+                        erros += 1
+                        continue
+                    ok = executar(db.table("produtos_revenda").update({
+                        "preco_revenda": r["avista"], "preco_revenda_cartao": r["cartao"],
+                    }).eq("id", p["id"]).eq("user_id", uid))
+                    erros += ok is None
+                if erros:
+                    st.warning(f"{erros} produto(s) não puderam ser recalculados (confira a margem).")
+                else:
+                    flash("Preços de todos os produtos recalculados e salvos!", "💰")
+                    st.rerun()
+
+            # Tabela-resumo + exportação (lista de preços)
+            linhas_exp = []
+            for p in produtos:
+                custo_t = to_f(p.get("preco_custo")) + to_f(p.get("frete_embalagem"))
+                linhas_exp.append({
+                    "Produto": p.get("nome_produto"), "Categoria": p.get("categoria"),
+                    "Custo (produto+frete)": custo_t, "Margem (%)": to_f(p.get("margem_pct"), 30.0),
+                    "Preço à vista/PIX": to_f(p.get("preco_revenda")),
+                    "Preço no cartão": to_f(p.get("preco_revenda_cartao")),
+                    "Estoque": int(p.get("qtd_estoque", 0)),
+                })
+            botoes_exportar(pd.DataFrame(linhas_exp), "lista_precos_revenda")
+
             for p in produtos:
                 pid = p["id"]
                 p_nome = p.get("nome_produto", "Sem Nome")
@@ -1212,6 +1403,13 @@ def aba_revenda(db, uid, cfg):
                 p_frete = to_f(p.get("frete_embalagem"))
                 p_qtd = int(p.get("qtd_estoque", 0))
                 p_min = int(p.get("estoque_minimo", 5))
+                custo_t = p_custo + p_frete
+                margem, manual, usa = parametros_revenda(p)
+
+                r_atual = precificar_revenda(custo_t, margem, manual, usa, cfg)
+                salvo = to_f(p.get("preco_revenda"))
+                base_exibida = salvo if salvo > 0 else (r_atual["avista"] if r_atual else 0.0)
+                r = decompor_preco(base_exibida, custo_t, usa, cfg) if base_exibida > 0 else None
 
                 if p_qtd == 0:
                     status = "🔴 **SEM ESTOQUE**"
@@ -1219,14 +1417,28 @@ def aba_revenda(db, uid, cfg):
                     status = f"⚠️ **BAIXO ESTOQUE** ({p_qtd} un)"
                 else:
                     status = f"🟢 **Em Estoque** ({p_qtd} un)"
+                preco_txt = f" | À vista: {brl(base_exibida)}" if base_exibida > 0 else ""
 
-                with st.expander(f"📦 **{p_nome}** | *{p_cat}* — {status} | Custo: {brl(p_custo + p_frete)}"):
+                with st.expander(f"📦 **{p_nome}** | *{p_cat}* — {status}{preco_txt}"):
                     chave_edit = f"edit_mode_{pid}"
                     if not st.session_state.get(chave_edit):
-                        i1, i2, i3 = st.columns(3)
-                        i1.write(f"• **Preço Custo:** {brl(p_custo)}")
-                        i2.write(f"• **Frete/Embalagem:** {brl(p_frete)}")
-                        i3.write(f"• **Estoque Mínimo:** {p_min} un")
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Custo (produto + frete)", brl(custo_t))
+                        if r:
+                            m2.metric("À vista / PIX", brl(r["avista"]))
+                            m3.metric("No cartão", brl(r["cartao"]))
+                            m4.metric("Lucro líquido", brl(r["lucro"]))
+                            tipo_preco = "preço manual" if manual > 0 else f"margem {fmt_num(margem, 0)}%"
+                            st.caption(
+                                f"Base: {tipo_preco} • marketplace: comissão {brl(r['comissao'])} + taxa fixa {brl(r['fixa'])} "
+                                f"• cartão: {brl(r['taxa_cartao_rs'])} • margem real {fmt_num(r['margem_real'], 1)}%"
+                            )
+                            if r_atual and abs(r_atual["avista"] - salvo) > 0.01 and salvo > 0:
+                                st.warning(f"Os custos/taxas mudaram: o preço atual seria {brl(r_atual['avista'])} "
+                                           "à vista. Use 'Recalcular e salvar' acima.")
+                        else:
+                            m2.warning("Margem alta demais para as taxas atuais.")
+                        st.caption(f"Estoque mínimo: {p_min} un")
                         st.divider()
                         b1, b2, _ = st.columns([1, 2, 1])
                         if b1.button("✏️ Editar", key=f"btn_edit_{pid}"):
@@ -1241,7 +1453,7 @@ def aba_revenda(db, uid, cfg):
                         with b2:
                             botao_excluir("🗑️ Excluir", f"prod_{pid}", _excluir)
                     else:
-                        st.markdown("**✏️ Editar Produto e Ajustar Estoque:**")
+                        st.markdown("**✏️ Editar Produto, Preço e Estoque:**")
                         with st.form(f"form_edit_{pid}"):
                             e_nome = st.text_input("Nome:", value=p_nome)
                             e_cat = st.text_input("Categoria:", value=p_cat)
@@ -1251,18 +1463,28 @@ def aba_revenda(db, uid, cfg):
                             ce3, ce4 = st.columns(2)
                             e_qtd = ce3.number_input("Estoque Atual (un):", value=p_qtd, min_value=0, step=1)
                             e_min = ce4.number_input("Estoque Mínimo (un):", value=p_min, min_value=0, step=1)
+                            ce5, ce6, ce7 = st.columns(3)
+                            e_margem = ce5.number_input("Margem (%)", min_value=0.0, max_value=90.0, value=margem, step=1.0)
+                            e_manual = ce6.number_input("Preço manual à vista (R$)", min_value=0.0, value=manual, step=0.10, format="%.2f")
+                            e_usa = ce7.checkbox("Vende no marketplace", value=usa)
                             cs, cc = st.columns(2)
                             salvar = cs.form_submit_button("💾 Salvar Alterações")
                             cancelar = cc.form_submit_button("❌ Cancelar")
                         if salvar:
-                            res = executar(db.table("produtos_revenda").update({
-                                "nome_produto": e_nome, "categoria": e_cat, "preco_custo": e_custo,
-                                "frete_embalagem": e_frete, "qtd_estoque": e_qtd, "estoque_minimo": e_min,
-                            }).eq("id", pid).eq("user_id", uid))
-                            if res is not None:
-                                st.session_state[chave_edit] = False
-                                flash("Produto e estoque atualizados!", "🎉")
-                                st.rerun()
+                            r_novo = precificar_revenda(e_custo + e_frete, e_margem, e_manual, e_usa, cfg)
+                            if r_novo is None:
+                                st.error("Margem + comissão chegam a 100% ou mais. Reduza a margem.")
+                            else:
+                                res = executar(db.table("produtos_revenda").update({
+                                    "nome_produto": e_nome, "categoria": e_cat, "preco_custo": e_custo,
+                                    "frete_embalagem": e_frete, "qtd_estoque": e_qtd, "estoque_minimo": e_min,
+                                    "margem_pct": e_margem, "preco_manual": e_manual, "usa_marketplace": e_usa,
+                                    "preco_revenda": r_novo["avista"], "preco_revenda_cartao": r_novo["cartao"],
+                                }).eq("id", pid).eq("user_id", uid))
+                                if res is not None:
+                                    st.session_state[chave_edit] = False
+                                    flash("Produto, preço e estoque atualizados!", "🎉")
+                                    st.rerun()
                         if cancelar:
                             st.session_state[chave_edit] = False
                             st.rerun()
@@ -1297,44 +1519,75 @@ def aba_revenda(db, uid, cfg):
                     resumo.append(f"• {q}x {po['nome_produto']}")
 
         with k2:
-            st.markdown("**⚙️ Taxas e Condições:**")
+            st.markdown("**⚙️ Custos e Condições:**")
             embalagem = st.number_input("Caixa / Embalagem Final do Kit (R$):", min_value=0.0, value=2.00, step=0.50, format="%.2f")
-            taxa_pct = st.number_input("Taxa Marketplace / Cartão (%):", min_value=0.0, value=cfg["taxa_cartao_pct"], step=0.5, format="%.1f")
-            taxa_fixa = st.number_input("Taxa Fixa no Cartão (R$):", min_value=0.0, value=0.0, step=0.5, format="%.2f")
-            margem = st.number_input("Margem de Lucro Desejada (%):", min_value=0.0, value=30.0, step=1.0, format="%.1f")
+            margem = st.number_input("Margem de Lucro Desejada (%):", min_value=0.0, max_value=90.0, value=30.0, step=1.0, format="%.1f")
+            usa_mkt = st.checkbox("Incluir taxas do marketplace (comissão + taxa fixa)", value=True,
+                                  help="Marcado: o preço à vista JÁ inclui as taxas do marketplace. "
+                                       "Desmarque para venda direta (WhatsApp).")
+            taxa_cartao = st.number_input("Taxa do cartão (%):", min_value=0.0, max_value=30.0,
+                                          value=cfg["taxa_cartao_pct"], step=0.5, format="%.1f",
+                                          help="Soma-se ao preço à vista só no valor do cartão.")
 
         st.divider()
-        custo_base = custo_itens + embalagem
-        div_cartao = 1.0 - (taxa_pct + margem) / 100.0
-        div_pix = 1.0 - margem / 100.0
-
         if not sel_ids:
             st.info("Selecione ao menos um produto para calcular o kit.")
             return
-        if div_cartao <= 0 or div_pix <= 0:
-            st.error("A soma de taxa + margem não pode chegar a 100%.")
-            return
 
-        # Cartão cobre taxa % + fixa + margem; PIX só a margem (sem taxas de cartão).
-        preco_cartao = (custo_base + taxa_fixa) / div_cartao
-        preco_pix = custo_base / div_pix
+        cfg_kit = {**cfg, "taxa_cartao_pct": taxa_cartao}
+        custo_base = custo_itens + embalagem
+        r = precificar_revenda(custo_base, margem, 0.0, usa_mkt, cfg_kit)
+        if r is None:
+            st.error("A soma da margem com a comissão do marketplace chega a 100% ou mais. Reduza a margem.")
+            return
         qtd_pecas = sum(q for _, q in itens_kit)
 
         st.markdown(f"### 📊 Resumo da Proposta: **{nome_kit or 'Kit sem nome'}**")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Preço no PIX", brl(preco_pix))
-        m2.metric("Preço no Cartão", brl(preco_cartao))
-        m3.metric("Total de Peças", f"{qtd_pecas} un")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("À vista / PIX", brl(r["avista"]))
+        m2.metric("No cartão", brl(r["cartao"]))
+        m3.metric("Lucro líquido", brl(r["lucro"]))
+        m4.metric("Total de Peças", f"{qtd_pecas} un")
+
+        if usa_mkt:
+            f_ap = faixa_do_preco(r["avista"], faixas)
+            st.caption(f"Faixa aplicada: {fmt_num(f_ap['comissao_pct'], 0)}% de comissão + "
+                       f"{brl(f_ap['taxa_fixa'] + cfg['marketplace_adicional'])} de taxa fixa por venda.")
+
+        tabela(tabela_decomposicao(r))
+
+        # Dica: faixa anterior mais barata
+        if usa_mkt:
+            idx = faixas.index(faixa_do_preco(r["avista"], faixas))
+            if idx > 0 and faixas[idx - 1]["ate"] is not None:
+                limite = faixas[idx - 1]["ate"]
+                if 0 < r["avista"] - limite <= 30:
+                    rl = decompor_preco(limite, custo_base, True, cfg_kit)
+                    if rl["lucro"] > 0:
+                        st.info(f"💡 Vendendo a {brl(limite)} (faixa anterior, taxa fixa menor) o lucro seria "
+                                f"{brl(rl['lucro'])} ({fmt_num(rl['margem_real'], 1)}%), contra {brl(r['lucro'])} "
+                                f"a {brl(r['avista'])}. Vale comparar.")
+
+        # Comparativo com os itens vendidos separados
+        precos_avulsos = [to_f(po.get("preco_revenda")) for po, _ in itens_kit]
+        if all(x > 0 for x in precos_avulsos):
+            soma = sum(to_f(po.get("preco_revenda")) * q for po, q in itens_kit)
+            st.caption(f"🧾 Os mesmos itens vendidos separados (à vista) somariam {brl(soma)}. "
+                       "No kit a taxa fixa do marketplace é cobrada uma vez só.")
 
         # --- Registrar venda (baixa estoque + lança no caixa) ---
         st.divider()
         st.subheader("✅ Registrar venda deste kit")
-        v1, v2, v3 = st.columns(3)
+        v1, v2, v3, v4 = st.columns(4)
         n_kits = v1.number_input("Quantidade de kits vendidos", min_value=1, value=1, step=1, key="n_kits_venda")
-        forma = v2.selectbox("Forma de pagamento", ["PIX", "Cartão"], key="forma_venda")
-        baixar = v3.checkbox("Dar baixa no estoque", value=True, key="baixa_estoque")
-        valor_unit = preco_pix if forma == "PIX" else preco_cartao
-        st.caption(f"Total da venda: **{brl(valor_unit * n_kits)}** — custo de material: {brl(custo_base * n_kits)}")
+        forma = v2.selectbox("Forma de pagamento", ["PIX / à vista", "Cartão"], key="forma_venda")
+        modo_valor = v3.selectbox("Valor lançado no caixa", ["Líquido (após taxas)", "Bruto (pago pelo cliente)"],
+                                  key="modo_valor_venda")
+        baixar = v4.checkbox("Dar baixa no estoque", value=True, key="baixa_estoque")
+        bruto_un = r["avista"] if forma.startswith("PIX") else r["cartao"]
+        valor_un = r["liquido"] if modo_valor.startswith("Líquido") else bruto_un
+        st.caption(f"Pago pelo cliente: **{brl(bruto_un * n_kits)}** • lançado no caixa: **{brl(valor_un * n_kits)}** "
+                   f"• custo de material: {brl(custo_base * n_kits)}")
 
         if st.button("💰 Registrar venda no Caixa", key="btn_reg_venda"):
             faltando = []
@@ -1347,10 +1600,13 @@ def aba_revenda(db, uid, cfg):
                 st.error("Estoque insuficiente: " + "; ".join(faltando))
             else:
                 desc = f"{n_kits}x {nome_kit or 'Kit'}" + (f" - {nome_cliente}" if nome_cliente else "")
+                desc += f" ({forma})"
+                if modo_valor.startswith("Líquido"):
+                    desc += f" [bruto {brl(bruto_un * n_kits)}]"
                 res = executar(db.table("fluxo_caixa").insert({
                     "user_id": uid, "data": str(datetime.date.today()), "tipo": "Entrada",
-                    "categoria": "Venda (Entrada)", "descricao": f"{desc} ({forma})",
-                    "valor": float(valor_unit * n_kits), "custo_material": float(custo_base * n_kits),
+                    "categoria": "Venda (Entrada)", "descricao": desc,
+                    "valor": float(valor_un * n_kits), "custo_material": float(custo_base * n_kits),
                 }))
                 if res is not None:
                     if baixar:
@@ -1370,8 +1626,8 @@ def aba_revenda(db, uid, cfg):
             f"🎁 *{nome_kit or 'Kit Especial'}*\n\n"
             f"📋 *Itens inclusos:*\n" + "\n".join(resumo) + "\n\n"
             f"💰 *Valores e Condições de Pagamento:*\n"
-            f"• *Valor no PIX (Desconto Especial):* {brl(preco_pix)}\n"
-            f"• *Valor no Cartão (em até 3x):* {brl(preco_cartao)}\n\n"
+            f"• *Valor à vista (PIX):* {brl(r['avista'])}\n"
+            f"• *Valor no Cartão:* {brl(r['cartao'])}\n\n"
             f"📦 *Prazo de Produção/Envio:* 2 a 4 dias úteis.\n"
             f"🗓️ *Proposta válida por 5 dias.*\n\n"
             f"Qualquer dúvida estou à disposição para finalizar seu pedido! ✨"
