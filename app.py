@@ -1301,6 +1301,55 @@ def parametros_revenda(p):
     return margem, manual, (True if usa is None else bool(usa))
 
 
+def calcular_kit_salvo(kit, prod_map, cfg):
+    """Recalcula um kit salvo com os custos e taxas de HOJE.
+    Retorna (resultado|None, custo_base, nomes_de_itens_removidos)."""
+    custo, ausentes = to_f(kit.get("embalagem")), []
+    for it in kit.get("itens") or []:
+        po = prod_map.get(it.get("produto_id"))
+        if not po:
+            ausentes.append(it.get("nome", "?"))
+            continue
+        custo += (to_f(po.get("preco_custo")) + to_f(po.get("frete_embalagem"))) * int(to_f(it.get("qtd"), 1))
+    usa = kit.get("usa_marketplace")
+    cfg_k = {**cfg, "taxa_cartao_pct": to_f(kit.get("taxa_cartao_pct"), cfg["taxa_cartao_pct"])}
+    r = precificar_revenda(custo, to_f(kit.get("margem_pct"), 30.0), to_f(kit.get("preco_manual")),
+                           True if usa is None else bool(usa), cfg_k)
+    return r, custo, ausentes
+
+
+def carregar_kit_no_montador(kit, ids_existentes, taxa_cartao_padrao):
+    """Callback do botão 'Carregar': preenche os campos do montador com o kit salvo."""
+    itens = [i for i in (kit.get("itens") or []) if i.get("produto_id") in ids_existentes]
+    st.session_state["kit_nome"] = kit.get("nome", "")
+    st.session_state["kit_sel"] = [i["produto_id"] for i in itens]
+    for i in itens:
+        st.session_state[f"qtd_kit_{i['produto_id']}"] = int(to_f(i.get("qtd"), 1))
+    st.session_state["kit_emb"] = to_f(kit.get("embalagem"), 2.0)
+    st.session_state["kit_margem"] = to_f(kit.get("margem_pct"), 30.0)
+    st.session_state["kit_manual"] = to_f(kit.get("preco_manual"), 0.0)
+    usa = kit.get("usa_marketplace")
+    st.session_state["kit_usa"] = True if usa is None else bool(usa)
+    st.session_state["kit_taxa"] = to_f(kit.get("taxa_cartao_pct"), taxa_cartao_padrao)
+    st.session_state["kit_id"] = kit["id"]
+    st.session_state["kit_id_nome"] = kit.get("nome", "")
+    perdidos = len(kit.get("itens") or []) - len(itens)
+    if perdidos:
+        flash(f"Kit carregado, mas {perdidos} item(ns) não existem mais no catálogo.", "⚠️")
+    else:
+        flash(f"Kit '{kit.get('nome', '')}' carregado no montador!", "📂")
+
+
+def limpar_kit_montador(taxa_cartao_padrao):
+    for chave, padrao in {
+        "kit_nome": "", "kit_cliente": "", "kit_sel": [], "kit_emb": 2.0, "kit_margem": 30.0,
+        "kit_usa": True, "kit_taxa": taxa_cartao_padrao, "kit_manual": 0.0,
+    }.items():
+        st.session_state[chave] = padrao
+    st.session_state.pop("kit_id", None)
+    st.session_state.pop("kit_id_nome", None)
+
+
 def aba_revenda(db, uid, cfg):
     st.header("🛍️ Gestão, Estoque e Precificação de Revenda")
     st.caption("Cadastre seus itens de revenda, controle o estoque, monte Kits e gere propostas para WhatsApp.")
@@ -1492,20 +1541,111 @@ def aba_revenda(db, uid, cfg):
     # ---------------- TAB 2: KITS & ORÇAMENTO ----------------
     with tab_kit:
         st.subheader("🎁 Montar Kit & Gerar Proposta Comercial")
-        st.caption("Monte combinações de produtos e gere o texto formatado para enviar ao cliente via WhatsApp.")
+        st.caption("Monte combinações de produtos, salve o kit para vendas futuras e gere o texto para o WhatsApp.")
 
         if not produtos:
             st.warning("⚠️ Cadastre produtos no catálogo para montar seus kits!")
             return
 
         prod_map = {p["id"]: p for p in produtos}
-        k1, k2 = st.columns(2)
 
+        # Estado inicial dos campos (permite carregar kits salvos dentro deles)
+        for chave, padrao in {
+            "kit_nome": "", "kit_cliente": "", "kit_sel": [], "kit_emb": 2.0, "kit_margem": 30.0,
+            "kit_usa": True, "kit_taxa": cfg["taxa_cartao_pct"], "kit_manual": 0.0,
+        }.items():
+            st.session_state.setdefault(chave, padrao)
+        st.session_state["kit_sel"] = [i for i in st.session_state["kit_sel"] if i in prod_map]
+
+        # ---------- Kits salvos ----------
+        try:
+            kits = carregar(db, "kits_revenda", uid, "nome")
+        except Exception:
+            kits = []
+            st.warning("Para salvar kits, rode o `supabase_setup.sql` atualizado no Supabase "
+                       "(ele cria a tabela `kits_revenda`).")
+
+        with st.expander(f"📚 Kits salvos ({len(kits)})"):
+            if not kits:
+                st.caption("Nenhum kit salvo ainda. Monte um kit abaixo e clique em 'Salvar kit'.")
+            else:
+                linhas_num = []
+                for k in kits:
+                    rk, custo_k, ausentes = calcular_kit_salvo(k, prod_map, cfg)
+                    salvo = to_f(k.get("preco_avista"))
+                    hoje = rk["avista"] if rk else 0.0
+                    if ausentes:
+                        situacao = "⚠️ item removido"
+                    elif rk is None:
+                        situacao = "⚠️ revisar margem"
+                    elif abs(hoje - salvo) > 0.01:
+                        situacao = "⚠️ desatualizado"
+                    else:
+                        situacao = "✅ atualizado"
+                    linhas_num.append({
+                        "Kit": k.get("nome"),
+                        "Itens": "; ".join(f"{i.get('qtd', 1)}x {i.get('nome', '?')}" for i in (k.get("itens") or [])),
+                        "Custo hoje": custo_k,
+                        "À vista salvo": salvo,
+                        "Cartão salvo": to_f(k.get("preco_cartao")),
+                        "À vista hoje": hoje,
+                        "Situação": situacao,
+                    })
+                df_k = pd.DataFrame(linhas_num)
+                df_k_view = df_k.copy()
+                for col in ("Custo hoje", "À vista salvo", "Cartão salvo", "À vista hoje"):
+                    df_k_view[col] = df_k_view[col].apply(brl)
+                tabela(df_k_view)
+                botoes_exportar(df_k.drop(columns=["Situação"]), "kits_salvos")
+
+                por_id_k = {k["id"]: k for k in kits}
+                escolhido = st.selectbox("Kit salvo:", list(por_id_k.keys()),
+                                         format_func=lambda i: por_id_k[i].get("nome", "Sem nome"), key="kit_pick")
+                kit_esc = por_id_k[escolhido]
+                b1, b2 = st.columns(2)
+                b1.button("📂 Carregar no montador", key="btn_carregar_kit", on_click=carregar_kit_no_montador,
+                          args=(kit_esc, set(prod_map.keys()), cfg["taxa_cartao_pct"]))
+                if b2.button("🔄 Recalcular preços de todos os kits", key="btn_recalc_kits",
+                             help="Use quando custos, margens ou taxas mudarem."):
+                    erros = 0
+                    for k in kits:
+                        rk, custo_k, ausentes = calcular_kit_salvo(k, prod_map, cfg)
+                        if rk is None or ausentes:
+                            erros += 1
+                            continue
+                        ok = executar(db.table("kits_revenda").update({
+                            "custo_base": custo_k, "preco_avista": rk["avista"], "preco_cartao": rk["cartao"],
+                        }).eq("id", k["id"]).eq("user_id", uid))
+                        erros += ok is None
+                    if erros:
+                        st.warning(f"{erros} kit(s) não foram recalculados (item removido ou margem alta demais).")
+                    else:
+                        flash("Preços dos kits recalculados e salvos!", "💰")
+                        st.rerun()
+
+                def _excluir_kit():
+                    if executar(db.table("kits_revenda").delete().eq("id", escolhido).eq("user_id", uid)) is not None:
+                        if st.session_state.get("kit_id") == escolhido:
+                            st.session_state.pop("kit_id", None)
+                            st.session_state.pop("kit_id_nome", None)
+                        flash("Kit excluído.", "🗑️")
+                        st.rerun()
+
+                botao_excluir("🗑️ Excluir kit selecionado", f"kit_{escolhido}", _excluir_kit)
+
+        # ---------- Montador ----------
+        if st.session_state.get("kit_id"):
+            ca, cb = st.columns([3, 1])
+            ca.info(f"✏️ Editando o kit salvo: **{st.session_state.get('kit_id_nome', '')}**")
+            cb.button("🧹 Novo kit (limpar)", key="btn_limpar_kit", on_click=limpar_kit_montador,
+                      args=(cfg["taxa_cartao_pct"],))
+
+        k1, k2 = st.columns(2)
         with k1:
-            nome_kit = st.text_input("Nome do Kit / Proposta:*", placeholder="Ex: Kit Presente Fofo Especial")
-            nome_cliente = st.text_input("Nome do Cliente (Opcional):", placeholder="Ex: Maria Clara")
+            nome_kit = st.text_input("Nome do Kit / Proposta:*", placeholder="Ex: Kit Presente Fofo Especial", key="kit_nome")
+            nome_cliente = st.text_input("Nome do Cliente (Opcional):", placeholder="Ex: Maria Clara", key="kit_cliente")
             sel_ids = st.multiselect(
-                "Selecione os produtos que compõem o kit:", options=list(prod_map.keys()),
+                "Selecione os produtos que compõem o kit:", options=list(prod_map.keys()), key="kit_sel",
                 format_func=lambda k: f"{prod_map[k]['nome_produto']} (Estoque: {prod_map[k].get('qtd_estoque', 0)})",
             )
             itens_kit, resumo, custo_itens = [], [], 0.0
@@ -1513,20 +1653,26 @@ def aba_revenda(db, uid, cfg):
                 st.markdown("**🔢 Quantidade de cada item no Kit:**")
                 for pid in sel_ids:
                     po = prod_map[pid]
-                    q = st.number_input(f"Qtd de '{po['nome_produto']}':", min_value=1, value=1, step=1, key=f"qtd_kit_{pid}")
+                    st.session_state.setdefault(f"qtd_kit_{pid}", 1)
+                    q = st.number_input(f"Qtd de '{po['nome_produto']}':", min_value=1, step=1, key=f"qtd_kit_{pid}")
                     itens_kit.append((po, q))
                     custo_itens += (to_f(po.get("preco_custo")) + to_f(po.get("frete_embalagem"))) * q
                     resumo.append(f"• {q}x {po['nome_produto']}")
 
         with k2:
             st.markdown("**⚙️ Custos e Condições:**")
-            embalagem = st.number_input("Caixa / Embalagem Final do Kit (R$):", min_value=0.0, value=2.00, step=0.50, format="%.2f")
-            margem = st.number_input("Margem de Lucro Desejada (%):", min_value=0.0, max_value=90.0, value=30.0, step=1.0, format="%.1f")
-            usa_mkt = st.checkbox("Incluir taxas do marketplace (comissão + taxa fixa)", value=True,
+            embalagem = st.number_input("Caixa / Embalagem Final do Kit (R$):", min_value=0.0, step=0.50,
+                                        format="%.2f", key="kit_emb")
+            margem = st.number_input("Margem de Lucro Desejada (%):", min_value=0.0, max_value=90.0, step=1.0,
+                                     format="%.1f", key="kit_margem")
+            manual = st.number_input("Preço manual à vista (R$) - opcional", min_value=0.0, step=0.10,
+                                     format="%.2f", key="kit_manual",
+                                     help="Se preencher (ex.: 59,90), esse preço vale e a margem real é recalculada.")
+            usa_mkt = st.checkbox("Incluir taxas do marketplace (comissão + taxa fixa)", key="kit_usa",
                                   help="Marcado: o preço à vista JÁ inclui as taxas do marketplace. "
                                        "Desmarque para venda direta (WhatsApp).")
-            taxa_cartao = st.number_input("Taxa do cartão (%):", min_value=0.0, max_value=30.0,
-                                          value=cfg["taxa_cartao_pct"], step=0.5, format="%.1f",
+            taxa_cartao = st.number_input("Taxa do cartão (%):", min_value=0.0, max_value=30.0, step=0.5,
+                                          format="%.1f", key="kit_taxa",
                                           help="Soma-se ao preço à vista só no valor do cartão.")
 
         st.divider()
@@ -1536,7 +1682,7 @@ def aba_revenda(db, uid, cfg):
 
         cfg_kit = {**cfg, "taxa_cartao_pct": taxa_cartao}
         custo_base = custo_itens + embalagem
-        r = precificar_revenda(custo_base, margem, 0.0, usa_mkt, cfg_kit)
+        r = precificar_revenda(custo_base, margem, manual, usa_mkt, cfg_kit)
         if r is None:
             st.error("A soma da margem com a comissão do marketplace chega a 100% ou mais. Reduza a margem.")
             return
@@ -1574,6 +1720,54 @@ def aba_revenda(db, uid, cfg):
             soma = sum(to_f(po.get("preco_revenda")) * q for po, q in itens_kit)
             st.caption(f"🧾 Os mesmos itens vendidos separados (à vista) somariam {brl(soma)}. "
                        "No kit a taxa fixa do marketplace é cobrada uma vez só.")
+
+        # --- Salvar kit ---
+        st.divider()
+        st.subheader("💾 Salvar este kit")
+        payload_kit = {
+            "nome": (nome_kit or "").strip(),
+            "itens": [{"produto_id": po["id"], "nome": po["nome_produto"], "qtd": int(q)} for po, q in itens_kit],
+            "embalagem": embalagem, "margem_pct": margem, "usa_marketplace": usa_mkt,
+            "taxa_cartao_pct": taxa_cartao, "preco_manual": manual,
+            "custo_base": custo_base, "preco_avista": r["avista"], "preco_cartao": r["cartao"],
+        }
+        kit_id = st.session_state.get("kit_id")
+        nomes_existentes = {k.get("nome", "").strip().lower(): k["id"] for k in kits}
+
+        def _salvar_novo():
+            if not payload_kit["nome"]:
+                st.error("Informe o nome do kit para salvar.")
+                return
+            if nomes_existentes.get(payload_kit["nome"].lower()):
+                st.error("Já existe um kit com esse nome. Use outro nome, ou carregue o kit e clique em 'Atualizar'.")
+                return
+            res = executar(db.table("kits_revenda").insert({"user_id": uid, **payload_kit}))
+            if res is not None:
+                if res.data:
+                    st.session_state["kit_id"] = res.data[0]["id"]
+                    st.session_state["kit_id_nome"] = payload_kit["nome"]
+                flash(f"Kit '{payload_kit['nome']}' salvo: à vista {brl(r['avista'])} | cartão {brl(r['cartao'])}", "💾")
+                st.rerun()
+
+        if kit_id:
+            s1, s2 = st.columns(2)
+            if s1.button(f"💾 Atualizar kit '{st.session_state.get('kit_id_nome', '')}'", key="btn_atualizar_kit"):
+                if not payload_kit["nome"]:
+                    st.error("Informe o nome do kit.")
+                else:
+                    outro = nomes_existentes.get(payload_kit["nome"].lower())
+                    if outro and outro != kit_id:
+                        st.error("Já existe outro kit com esse nome.")
+                    elif executar(db.table("kits_revenda").update(payload_kit)
+                                  .eq("id", kit_id).eq("user_id", uid)) is not None:
+                        st.session_state["kit_id_nome"] = payload_kit["nome"]
+                        flash("Kit atualizado!", "💾")
+                        st.rerun()
+            if s2.button("➕ Salvar como novo kit", key="btn_salvar_novo_kit"):
+                _salvar_novo()
+        else:
+            if st.button("💾 Salvar kit", key="btn_salvar_kit"):
+                _salvar_novo()
 
         # --- Registrar venda (baixa estoque + lança no caixa) ---
         st.divider()
